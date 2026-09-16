@@ -10,7 +10,7 @@ written yet, per Phase 0 scope.
 
 | Method | Cloned | Installs cleanly | Runs on toy data | Notes |
 |---|---|---|---|---|
-| SPACETIME | yes | yes (`uv pip install -r src/requirements.txt`) | yes, but slow | see below |
+| SPACETIME | yes | yes (`uv pip install -r src/requirements.txt`) | yes, confirmed (slow, ~17-18 min wall time for toy demo) | see below |
 | CASTOR (linear) | yes | yes (`uv pip install -r requirements.txt`) | yes, fast (~seconds) | see below |
 | CASTOR (nonlinear) | yes | yes (same env) | yes, confirmed (slow, ~7 min for toy data) | see below |
 | FANTOM | **no** | n/a | n/a | repo not reachable — see "FANTOM" section |
@@ -27,16 +27,21 @@ written yet, per Phase 0 scope.
 - Entry point: `src/demo.py`. Runs a synthetic multi-regime time series
   generator (`exp.utils.gen_timeseries.gen_timeseries`) and feeds it to
   `st.spacetime.SpaceTime`.
-- **Runs out of the box**, no code changes needed. However it is
-  **very slow even on toy data**: the shipped demo (T=500, N=5 nodes, C=2
-  contexts, R=3 regimes) took 25+ minutes of full single-core-pegged CPU time
-  for the DAG-search phase alone on this machine (4 vCPUs). The change-point
-  search (CPS) phase finishes quickly (seconds) and produces good regime
-  recovery (F1 up to 1.0 in one run); it's the subsequent DAG search
-  ("Phase 0/1/2" edge scoring) that dominates runtime.
+- **Runs out of the box, confirmed exit code 0**, no code changes needed.
+  However it is **very slow even on toy data**: the shipped demo (T=500,
+  N=5 nodes, C=2 contexts, R=3 regimes) took ~17-18 minutes of wall time
+  (single-core-pegged CPU) end to end on this machine (4 vCPUs) — Forward
+  DAG search alone took 493s and Backward search 546s. The change-point
+  search (CPS) phase finishes quickly (seconds) and produced perfect regime
+  recovery (F1=1.0, ARI=1.0, NMI=1.0 against ground truth). Final result:
+  DAG search converged after 0 additional interleaving iterations (CPS was
+  already correct after the first DAG search), recovering edges
+  `4->0, 4->3, 0->2, 4->2, 1->2` out of the demo's 5-node graph.
   - Implication for the benchmark: toy scenarios should probably use fewer
     nodes/timesteps than the shipped demo, or budget significant wall-clock
-    time per run.
+    time per run — at N=5, T=500 a single SPACETIME run costs ~15-20 min of
+    CPU time, which will dominate the benchmark's compute budget if we run
+    many (method × condition × seed) combinations at this scale.
 - **Minimal input format**: a `Dataset`-like object (`data.datasets`) as
   produced by `gen_timeseries`; internally this is per-context per-regime
   numpy arrays of shape `(T, N)`. Using SPACETIME on our own generated data
@@ -160,10 +165,10 @@ For future sessions, consider installing CPU-only torch wheels (`--index-url
 https://download.pytorch.org/whl/cpu`) to cut disk usage substantially if
 GPU is never available in the dev environment.
 
-## Open items / still running at time of writing
+## Open items
 
-- SPACETIME's `demo.py` and CASTOR's nonlinear smoke test were both still
-  running in the background when this report was drafted (both are
-  CPU-bound and slow even on tiny toy inputs). Will confirm final
-  success/failure and append results once they complete.
-- FANTOM needs your input on how to proceed (see above).
+- FANTOM needs your input on how to proceed (see above) before it can be
+  verified or included in the benchmark.
+- All other Phase 0 verification is complete: SPACETIME, CASTOR
+  (linear + nonlinear), and PCMCI+/J-PCMCI+ all confirmed running
+  end-to-end on toy data with exit code 0.
