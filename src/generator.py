@@ -2,18 +2,24 @@
 Matched-counterfactual data generator for the regime-aware causal discovery
 benchmark.
 
-Generates three scenario types that share the same underlying DAG and are
-calibrated to produce a comparably sized marginal distribution shift at a
-changepoint, but differ in *why* the shift happens:
+Generates three scenario types that share the same underlying DAG and the
+same randomly-selected set of "affected" nodes, calibrated to produce a
+comparably sized marginal variance increase at a changepoint restricted to
+those affected nodes -- but differ in *why* the shift happens:
 
-- "mechanism":   the causal graph itself changes at the changepoint (edge
-                 weights/structure change) -- a TRUE mechanism change.
-- "confounding": the graph is unchanged; an unobserved common cause shifts
-                 its variance at the changepoint, inflating the observed
-                 variance of the nodes it affects without any true
-                 structural change among observed variables.
+- "mechanism":   the causal graph itself changes at the changepoint: each
+                 affected node gains/strengthens a self-loop (its own lag-1
+                 persistence increases) -- a TRUE mechanism change. This is
+                 a provably variance-increasing perturbation in isolation
+                 (Var of an AR(1) component = q / (1 - phi^2), monotonically
+                 increasing in phi), and is verified at runtime.
+- "confounding": the graph is unchanged; an unobserved common cause (loaded
+                 only onto the affected nodes) increases its variance at the
+                 changepoint, inflating the observed variance of exactly the
+                 affected nodes without any true structural change among
+                 observed variables.
 - "noise":       the graph is unchanged; only the idiosyncratic noise
-                 variance of each node shifts at the changepoint.
+                 variance of the affected nodes increases at the changepoint.
 
 Data model: a linear-Gaussian VAR(1) process with an additional unobserved
 scalar confounder,
@@ -23,16 +29,23 @@ scalar confounder,
 
 where A is the lag-1 weighted adjacency matrix of the DAG among observed
 nodes ("j -> i" iff A[i, j] != 0), and b is a fixed loading vector picking
-out which nodes the latent confounder affects. The three scenario types
-differ in which one of {A, sigma_u, sigma_eps} changes at the changepoint.
+out which nodes the latent confounder affects.
+
+Shared randomization: for a given seed, a single "affected_frac ~
+Uniform(0.25, 1.0)" draw and a single random subset of that many nodes
+(`affected_nodes`) are drawn *before* branching on scenario_type, and reused
+by all three scenarios: it decides which nodes the confounder loads onto,
+which nodes' noise increases, and which nodes get a strengthened self-loop.
+So for a fixed seed, all three scenarios target the *same* nodes.
 
 Calibration: for a stable VAR(1) process, the stationary covariance Sigma
 solves the discrete Lyapunov equation Sigma = A Sigma A^T + Q, with
 Q = b b^T sigma_u^2 + diag(sigma_eps^2). Each scenario's post-changepoint
 perturbation strength is calibrated via 1-D root finding so the resulting
-increase in average marginal variance (mean of diag(Sigma_post) minus mean
-of diag(Sigma_pre)) matches the same target across all three scenarios --
-i.e. the size of the marginal shift is matched by construction, only its
+increase in *average marginal variance of the affected nodes only* (mean of
+diag(Sigma_post) over affected_nodes minus the same over Sigma_pre) matches
+the same target across all three scenarios -- i.e. the size and the set of
+nodes carrying the marginal shift are matched by construction, only the
 cause differs.
 """
 from __future__ import annotations
@@ -60,12 +73,17 @@ class MatchedScenario:
     n_nodes: int
     T: int
     seed: int
-    shift_size: float  # achieved increase in average marginal variance (post - pre)
+    affected_nodes: np.ndarray  # node indices targeted by the changepoint perturbation
+    shift_size: float  # achieved increase in avg marginal variance of affected_nodes (post - pre)
     latent_confounder: Optional[np.ndarray] = None  # (T,) values of U_t, diagnostics only
 
 
 def _weighted_var1_matrix(n_nodes, edge_prob, rng, spectral_radius=0.6):
-    """Random sparse weighted VAR(1) matrix A; A[i, j] != 0 means j -> i at lag 1."""
+    """Random sparse weighted VAR(1) matrix A; A[i, j] != 0 means j -> i at lag 1.
+
+    Diagonal is left at zero here -- self-loops are reserved for the
+    "mechanism" scenario's changepoint perturbation.
+    """
     A = np.zeros((n_nodes, n_nodes))
     for i in range(n_nodes):
         for j in range(n_nodes):
@@ -79,24 +97,37 @@ def _weighted_var1_matrix(n_nodes, edge_prob, rng, spectral_radius=0.6):
     return A
 
 
-def _confounder_loading(n_nodes, rng, frac=0.5):
-    """Loading vector for the unobserved confounder: which nodes it affects."""
+def _draw_affected_nodes(n_nodes, rng, frac_low=0.25, frac_high=1.0):
+    """Shared randomization: fraction and identity of nodes targeted by the changepoint,
+    drawn once per seed and reused by all three scenario types.
+    """
+    affected_frac = rng.uniform(frac_low, frac_high)
+    n_affected = max(1, int(round(affected_frac * n_nodes)))
+    affected_nodes = np.sort(rng.choice(n_nodes, size=n_affected, replace=False))
+    return affected_nodes
+
+
+def _confounder_loading(n_nodes, affected_nodes, rng):
+    """Loading vector for the unobserved confounder: nonzero only on affected_nodes."""
     b = np.zeros(n_nodes)
-    n_affected = max(1, int(round(frac * n_nodes)))
-    affected = rng.choice(n_nodes, size=n_affected, replace=False)
-    b[affected] = rng.uniform(0.5, 1.0, size=n_affected) * rng.choice([-1.0, 1.0], size=n_affected)
+    b[affected_nodes] = rng.uniform(0.5, 1.0, size=len(affected_nodes)) * rng.choice(
+        [-1.0, 1.0], size=len(affected_nodes)
+    )
     return b
 
 
-def _safe_avg_marginal_var(A, Q):
-    """mean(diag(stationary covariance)), or None if A is not stable (Lyapunov ill-posed)."""
+def _safe_stationary_cov(A, Q):
+    """Stationary covariance Sigma = A Sigma A^T + Q, or None if A is not stable."""
     try:
         if np.max(np.abs(np.linalg.eigvals(A))) >= 0.995:
             return None
-        Sigma = solve_discrete_lyapunov(A, Q)
-        return float(np.mean(np.diag(Sigma)))
+        return solve_discrete_lyapunov(A, Q)
     except np.linalg.LinAlgError:
         return None
+
+
+def _avg_var_on(Sigma, nodes):
+    return float(np.mean(np.diag(Sigma)[nodes]))
 
 
 def _graph_from_matrix(A, threshold=1e-8):
@@ -111,8 +142,8 @@ def _graph_from_matrix(A, threshold=1e-8):
     return g
 
 
-def _calibrate_strength(model_fn, base_avg_var, target_shift, s_max=20.0):
-    """Find scale s >= 0 such that avg_marginal_var(model_fn(s)) - base_avg_var == target_shift.
+def _calibrate_strength(model_fn, affected_nodes, base_avg_var, target_shift, s_max=20.0):
+    """Find scale s >= 0 such that avg_var_on(model_fn(s), affected_nodes) - base_avg_var == target_shift.
 
     model_fn(s) -> (A_s, Q_s). Stays within the region where A_s is stable;
     treats instability as "overshoot" so the search brackets below it.
@@ -120,10 +151,10 @@ def _calibrate_strength(model_fn, base_avg_var, target_shift, s_max=20.0):
 
     def f(s):
         A_s, Q_s = model_fn(s)
-        v = _safe_avg_marginal_var(A_s, Q_s)
-        if v is None:
+        Sigma = _safe_stationary_cov(A_s, Q_s)
+        if Sigma is None:
             return 1e6
-        return v - base_avg_var - target_shift
+        return _avg_var_on(Sigma, affected_nodes) - base_avg_var - target_shift
 
     lo, hi = 0.0, s_max
     if f(lo) >= 0:
@@ -149,18 +180,21 @@ def generate_matched_scenario(
     spectral_radius: float = 0.6,
     base_noise_std: float = 1.0,
     base_confounder_std: float = 1.0,
-    confounder_frac: float = 0.5,
+    affected_frac_range: tuple = (0.25, 1.0),
     target_shift_ratio: float = 0.6,
     burn_in: int = 50,
 ) -> MatchedScenario:
     """Generate a single matched-counterfactual scenario.
 
     All three scenario types share the same base DAG (`A_base`), the same
+    randomly-drawn set of `affected_nodes` (see module docstring), the same
     latent-confounder loading vector, and the same base noise levels. They
-    differ only in *what* changes at the changepoint (graph / confounder
-    variance / idiosyncratic noise variance), with the change strength
-    calibrated so the resulting shift in average marginal variance matches
-    `target_shift_ratio * base average marginal variance` in all three cases.
+    differ only in *what* changes at the changepoint for the affected nodes
+    (self-loop strength / confounder variance / idiosyncratic noise
+    variance), with the change strength calibrated so the resulting shift in
+    average marginal variance *of the affected nodes* matches
+    `target_shift_ratio * base average marginal variance of affected nodes`
+    in all three cases.
 
     :param n_nodes: number of observed nodes
     :param T: number of time steps in the returned series
@@ -171,9 +205,11 @@ def generate_matched_scenario(
     :param spectral_radius: target spectral radius of the base VAR(1) matrix (stability)
     :param base_noise_std: pre-changepoint idiosyncratic noise std (per node)
     :param base_confounder_std: pre-changepoint latent confounder std
-    :param confounder_frac: fraction of nodes affected by the latent confounder
+    :param affected_frac_range: (low, high) range to draw the fraction of
+        nodes targeted by the changepoint perturbation from, uniformly
     :param target_shift_ratio: target relative increase in average marginal
-        variance at the changepoint (e.g. 0.6 = +60%), matched across scenarios
+        variance of the affected nodes at the changepoint (e.g. 0.6 = +60%),
+        matched across scenarios
     :param burn_in: samples simulated and discarded before t=0, so the
         pre-changepoint regime starts near its stationary distribution
     :return: MatchedScenario
@@ -187,38 +223,68 @@ def generate_matched_scenario(
 
     rng = np.random.default_rng(seed)
 
-    # --- shared base model (identical across all scenario types) ---
+    # --- shared base model + shared node randomization (identical across all scenario types) ---
     A_base = _weighted_var1_matrix(n_nodes, edge_prob, rng, spectral_radius)
-    b = _confounder_loading(n_nodes, rng, confounder_frac)
+    affected_nodes = _draw_affected_nodes(n_nodes, rng, *affected_frac_range)
+    b = _confounder_loading(n_nodes, affected_nodes, rng)
     sigma_eps_base = np.full(n_nodes, base_noise_std)
     sigma_u_base = base_confounder_std
 
     Q_base = np.outer(b, b) * sigma_u_base**2 + np.diag(sigma_eps_base**2)
-    base_avg_var = _safe_avg_marginal_var(A_base, Q_base)
+    Sigma_pre = _safe_stationary_cov(A_base, Q_base)
+    base_avg_var = _avg_var_on(Sigma_pre, affected_nodes)
     target_shift = target_shift_ratio * base_avg_var
 
-    # direction of the "mechanism" perturbation: an independently drawn weight
-    # matrix combined with A_base encodes both re-weighted and added/removed edges
-    A_dir = _weighted_var1_matrix(n_nodes, edge_prob, rng, spectral_radius=1.0) - A_base
-
     if scenario_type == "mechanism":
-        model_fn = lambda s: (A_base + s * A_dir, Q_base)
-        s = _calibrate_strength(model_fn, base_avg_var, target_shift)
+        # strengthen each affected node's own lag-1 self-loop (phi_i: 0 -> s).
+        # Var(AR(1) component) = q / (1 - phi^2) is monotonically increasing in
+        # |phi| for phi in (-1, 1), so this provably increases the affected
+        # node's variance in isolation; verified against the full multivariate
+        # Lyapunov solution below.
+        def model_fn(s):
+            A_s = A_base.copy()
+            for i in affected_nodes:
+                A_s[i, i] = s
+            return A_s, Q_base
+
+        s = _calibrate_strength(model_fn, affected_nodes, base_avg_var, target_shift)
         A_post, Q_post = model_fn(s)
         sigma_u_post, sigma_eps_post = sigma_u_base, sigma_eps_base
     elif scenario_type == "confounding":
-        model_fn = lambda s: (A_base, np.outer(b, b) * (sigma_u_base + s) ** 2 + np.diag(sigma_eps_base**2))
-        s = _calibrate_strength(model_fn, base_avg_var, target_shift)
+        A_post = A_base
+
+        def model_fn(s):
+            return A_base, np.outer(b, b) * (sigma_u_base + s) ** 2 + np.diag(sigma_eps_base**2)
+
+        s = _calibrate_strength(model_fn, affected_nodes, base_avg_var, target_shift)
         A_post, Q_post = model_fn(s)
         sigma_u_post, sigma_eps_post = sigma_u_base + s, sigma_eps_base
     else:  # noise
-        model_fn = lambda s: (A_base, np.outer(b, b) * sigma_u_base**2 + np.diag((sigma_eps_base + s) ** 2))
-        s = _calibrate_strength(model_fn, base_avg_var, target_shift)
-        A_post, Q_post = model_fn(s)
-        sigma_u_post, sigma_eps_post = sigma_u_base, sigma_eps_base + s
+        def model_fn(s):
+            sigma_eps_s = sigma_eps_base.copy()
+            sigma_eps_s[affected_nodes] += s
+            return A_base, np.outer(b, b) * sigma_u_base**2 + np.diag(sigma_eps_s**2)
 
-    post_avg_var = _safe_avg_marginal_var(A_post, Q_post)
+        s = _calibrate_strength(model_fn, affected_nodes, base_avg_var, target_shift)
+        A_post, Q_post = model_fn(s)
+        sigma_eps_post = sigma_eps_base.copy()
+        sigma_eps_post[affected_nodes] += s
+        sigma_u_post = sigma_u_base
+
+    Sigma_post = _safe_stationary_cov(A_post, Q_post)
+    post_avg_var = _avg_var_on(Sigma_post, affected_nodes)
     achieved_shift = post_avg_var - base_avg_var
+
+    # runtime guarantee: every affected node's own marginal variance must have
+    # increased (not just the average across affected nodes)
+    pre_diag = np.diag(Sigma_pre)
+    post_diag = np.diag(Sigma_post)
+    if np.any(post_diag[affected_nodes] <= pre_diag[affected_nodes]):
+        raise RuntimeError(
+            f"scenario_type={scenario_type!r}, seed={seed}: calibration failed to increase "
+            f"variance for every affected node individually "
+            f"(pre={pre_diag[affected_nodes]}, post={post_diag[affected_nodes]})"
+        )
 
     # --- simulate the actual finite time series (with burn-in for the pre-regime) ---
     T_total = burn_in + T
@@ -252,6 +318,7 @@ def generate_matched_scenario(
         n_nodes=n_nodes,
         T=T,
         seed=seed,
+        affected_nodes=affected_nodes,
         shift_size=achieved_shift,
         latent_confounder=latent,
     )
