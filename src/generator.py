@@ -244,6 +244,7 @@ def generate_matched_scenario(
     strength_regime: str = "below_threshold",
     changepoint: Optional[int] = None,
     gamma: float = 1.0,
+    gamma_multiplier: Optional[float] = None,
     base_noise_std: float = 1.0,
     affected_frac_range: tuple = (0.25, 1.0),
     burn_in: int = 0,
@@ -263,8 +264,13 @@ def generate_matched_scenario(
         delta_star, calibration must fail for confounding/noise -- raises
         CalibrationImpossibleError)
     :param changepoint: index where the regime switches; defaults to T // 2
-    :param gamma: Gaussian-kernel bandwidth, shared by every tested edge
-        (a fixed hyperparameter of the generator, not fit to data)
+    :param gamma: Gaussian-kernel bandwidth, shared by every tested edge as
+        an absolute value. Ignored if `gamma_multiplier` is given.
+    :param gamma_multiplier: if given, each tested edge's bandwidth is
+        computed as `gamma_multiplier * sqrt(sigma_W2)` for that edge's own
+        parent -- a median-heuristic-style scaling to the data's own scale,
+        so gamma varies per edge even within one seed (edges have different
+        parents, hence different sigma_W2). Takes precedence over `gamma`.
     :param base_noise_std: residual/noise std, shared by every node
     :param affected_frac_range: (low, high) range to draw the fraction of
         (non-source) nodes that get a tested edge from, uniformly
@@ -299,13 +305,14 @@ def generate_matched_scenario(
     for i in affected_nodes:
         parent = parent_of[i]
         sigma_W2 = var_of[parent]
-        d_star = delta_star(sigma2, gamma, sigma_W2)
+        edge_gamma = gamma_multiplier * math.sqrt(sigma_W2) if gamma_multiplier is not None else gamma
+        d_star = delta_star(sigma2, edge_gamma, sigma_W2)
         delta_a_target = fraction * d_star
-        target_mmd2 = mmd2_mechanism(delta_a_target, sigma2, gamma, sigma_W2)
+        target_mmd2 = mmd2_mechanism(delta_a_target, sigma2, edge_gamma, sigma_W2)
 
         edge = TestedEdge(
             child=int(i), parent=int(parent), sigma2=sigma2, sigma_W2=sigma_W2,
-            gamma=gamma, delta_star=d_star,
+            gamma=edge_gamma, delta_star=d_star,
         )
 
         if scenario_type == "mechanism":
@@ -315,12 +322,12 @@ def generate_matched_scenario(
             a_post[i] = a1
             edge.delta_a_target = delta_a_target
             edge.target_mmd2 = target_mmd2
-            edge.achieved_mmd2 = mmd2_mechanism(abs(a1 - a0), sigma2, gamma, sigma_W2)
+            edge.achieved_mmd2 = mmd2_mechanism(abs(a1 - a0), sigma2, edge_gamma, sigma_W2)
         else:  # confounding or noise: solve for the matching delta (may raise)
-            delta = solve_matching_delta(target_mmd2, sigma2, gamma)
+            delta = solve_matching_delta(target_mmd2, sigma2, edge_gamma)
             edge.delta_confound_or_noise = delta
             edge.target_mmd2 = target_mmd2
-            edge.achieved_mmd2 = mmd2_confound_or_noise(delta, sigma2, gamma)
+            edge.achieved_mmd2 = mmd2_confound_or_noise(delta, sigma2, edge_gamma)
             if scenario_type == "confounding":
                 confound_delta[i] = delta
             else:  # noise
