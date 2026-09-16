@@ -12,7 +12,7 @@ written yet, per Phase 0 scope.
 |---|---|---|---|---|
 | SPACETIME | yes | yes (`uv pip install -r src/requirements.txt`) | yes, but slow | see below |
 | CASTOR (linear) | yes | yes (`uv pip install -r requirements.txt`) | yes, fast (~seconds) | see below |
-| CASTOR (nonlinear) | yes | yes (same env) | yes, but slow | see below |
+| CASTOR (nonlinear) | yes | yes (same env) | yes, confirmed (slow, ~7 min for toy data) | see below |
 | FANTOM | **no** | n/a | n/a | repo not reachable — see "FANTOM" section |
 | PCMCI+ / J-PCMCI+ (tigramite) | n/a (pip) | yes, with 1 fix | yes, fast (<1s for toy data) | see below |
 
@@ -64,10 +64,14 @@ written yet, per Phase 0 scope.
   regimes, 3 nodes, 80+80 samples completed in a few seconds
   (`castor.run_linear(2, 1, 0.4, 20, 20)` → returns `model_n, graphss,
   gamma_hat, L`).
-- **Nonlinear CASTOR runs but is slow**: same toy size (2 regimes, 3 nodes,
-  160 samples total) took well over several minutes of CPU time (trains an
-  MLP per regime candidate via L-BFGS). Final confirmation pending — see
-  "Still running" below.
+- **Nonlinear CASTOR runs successfully but is slow**: same toy size (2
+  regimes, 3 nodes, 160 samples total) took ~7 minutes of CPU time (trains
+  an MLP per regime candidate via L-BFGS). Confirmed exit code 0, returning
+  `(gamma_hat, model_n)` with `gamma_hat.shape == (160, 4)` — note it
+  converged to 4 candidate regimes rather than the 2 true ones for this
+  under-tuned toy call (`run_nonlinear(3, 0.7, 20, torch.device('cpu'),
+  20)` used very low iteration/window budgets for speed); regime-count
+  accuracy needs real hyperparameter tuning, not a Phase 0 concern.
 - **Minimal input format**: `CASTOR(data: pd.DataFrame, X_syn: np.ndarray,
   X_lag_syn: np.ndarray, lags=2)`, where `X_syn` is the "current time step"
   block (`N` columns) and `X_lag_syn` is the lagged block (`N * lags`
